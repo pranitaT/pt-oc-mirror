@@ -237,3 +237,383 @@ func LocalMirrorFromFiles(source string, destination string) error {
 	})
 	return err
 }
+
+func CreateRegistry() *httptest.Server {
+	// Set up a fake registry.
+	s := httptest.NewServer(registry.New())
+
+	return s
+}
+
+func buildAndPushFakeImage(content map[string][]byte, imgRef string, dir string) (string, error) {
+	var digest v1.Hash
+	tag, err := name.NewTag(imgRef)
+	if err != nil {
+		return "", err
+	}
+	i, _ := crane.Image(content)
+	if err := crane.Push(i, tag.String()); err != nil {
+		return "", err
+	}
+	if dir == "" {
+		digest, err = i.Digest()
+		if err != nil {
+			return "", err
+		}
+		return digest.String(), nil
+	}
+	lp, err := layout.Write(dir, empty.Index)
+	if err != nil {
+		return "", err
+	}
+	if err := lp.AppendImage(i); err != nil {
+		return "", err
+	}
+	idx, err := lp.ImageIndex()
+	if err != nil {
+		return "", err
+	}
+	if err := remote.WriteIndex(tag, idx); err != nil {
+		return "", err
+	}
+	digest, err = idx.Digest()
+	if err != nil {
+		return "", err
+	}
+
+	return digest.String(), nil
+}
+
+// GetAllManifestDigests retrieves all manifest digests from a pushed image.
+//
+// The returned slice always starts with the digest of the referenced manifest:
+//   - single image (OCI manifest or Docker schema 2): only that digest.
+//   - image index / manifest list: that digest followed by the digest of every
+//     child manifest, in index order. An empty index is valid and yields only
+//     the index digest, because it has no children to report.
+//
+// Any other media type (e.g. Docker schema 1, or an unexpected Content-Type
+// sent by the registry) is an error, as it cannot be determined whether child
+// manifests exist. On error the returned slice is always nil: callers never
+// receive a partial list together with a nil error.
+func GetAllManifestDigests(imgRef string) ([]string, error) {
+	ref, err := name.ParseReference(imgRef)
+	if err != nil {
+		return nil, fmt.Errorf("parsing image reference %q: %w", imgRef, err)
+	}
+
+	desc, err := remote.Get(ref)
+	if err != nil {
+		return nil, fmt.Errorf("fetching manifest for %q: %w", imgRef, err)
+	}
+
+	digests := []string{desc.Digest.String()}
+
+	if desc.MediaType.IsImage() {
+		return digests, nil
+	}
+
+	if !desc.MediaType.IsIndex() {
+		return nil, fmt.Errorf("unsupported manifest media type %q for %q (digest %s): expected an image or an image index",
+			desc.MediaType, imgRef, desc.Digest)
+	}
+
+	idx, err := desc.ImageIndex()
+	if err != nil {
+		return nil, fmt.Errorf("converting %q (media type %s) to an image index: %w", imgRef, desc.MediaType, err)
+	}
+
+	idxManifest, err := idx.IndexManifest()
+	if err != nil {
+		return nil, fmt.Errorf("parsing index manifest of %q (digest %s, media type %s): %w",
+			imgRef, desc.Digest, desc.MediaType, err)
+	}
+
+	for _, m := range idxManifest.Manifests {
+		digests = append(digests, m.Digest.String())
+	}
+
+	return digests, nil
+}
+
+// GenerateFakeImage will use go-containerregistry to push a test image to
+// an httptest.Server and will write the image to an OCI layout if dir is not "".
+func GenerateFakeImage(content, imgRef string, tempFolder string) (string, error) {
+	imgSpec, err := image.ParseRef(imgRef)
+	if err != nil {
+		return "", err
+	}
+	sanitizedTagOrDigest := imgSpec.Tag
+	if imgSpec.Tag == "" {
+		sanitizedTagOrDigest = imgSpec.Digest
+	} else {
+		sanitizedTagOrDigest = strings.ReplaceAll(sanitizedTagOrDigest, ".", "-")
+	}
+
+	indexFolder := filepath.Join(tempFolder, imgSpec.PathComponent, sanitizedTagOrDigest)
+	err = os.MkdirAll(indexFolder, 0o755)
+	if err != nil {
+		return "", err
+	}
+	c := map[string][]byte{
+		"/testfile": []byte("test contents " + content),
+	}
+	return buildAndPushFakeImage(c, imgRef, indexFolder)
+}
+
+func ByteArrayFromTemplate(templatePath string, tokens []string) ([]byte, error) {
+	exBytes := []byte{}
+	buf := bytes.NewBuffer(exBytes)
+	tmpl, err := template.ParseFiles(templatePath)
+	if err != nil {
+		return []byte{}, err
+	}
+	err = tmpl.Execute(buf, tokens)
+	if err != nil {
+		return []byte{}, err
+	}
+	return buf.Bytes(), nil
+}
+
+func ImgRefsFromTemplate(filePath, templatePath string, token releaseContents) error {
+	exBytes := []byte{}
+	buf := bytes.NewBuffer(exBytes)
+	tmpl, err := template.ParseFiles(templatePath)
+	if err != nil {
+		return err
+	}
+	err = tmpl.Execute(buf, token)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, buf.Bytes(), 0o600)
+}
+
+func FileFromTemplate(filePath, templatePath string, tokens []string) error {
+	bytes, err := ByteArrayFromTemplate(templatePath, tokens)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("registries.conf contents: %v", string(bytes))
+	return os.WriteFile(filePath, bytes, 0o600)
+}
+
+func ImageExists(imgRef string) (bool, error) {
+	desc, err := crane.Head(imgRef)
+	if err != nil {
+		return false, err
+	}
+	if desc != nil {
+		return true, nil
+	}
+	return false, nil
+}
+
+type releaseContents struct {
+	Ref1 string
+	Ref2 string
+	Ref3 string
+}
+
+func GenerateReleaseAndComponents(toRegistry, tempFolder string, templatePath string) (string, []string, error) {
+	contents := releaseContents{}
+	relatedImages := []string{}
+	// generating a fake release with 3 components
+	component1 := toRegistry + "/openshift-release-dev/ocp-v4.0-art-dev:component1"
+	digest1, err := GenerateFakeImage("component1", component1, tempFolder)
+	if err != nil {
+		return "", relatedImages, err
+	}
+	contents.Ref1 = toRegistry + "/openshift-release-dev/ocp-v4.0-art-dev@" + digest1
+	relatedImages = append(relatedImages, contents.Ref1)
+
+	// Push signature images for all manifests in component1
+	digests1, err := GetAllManifestDigests(component1)
+	if err != nil {
+		return "", relatedImages, fmt.Errorf("failed to get manifests for component1: %w", err)
+	}
+	for _, d := range digests1 {
+		if err := PushSignatureImage(d, toRegistry, "openshift-release-dev/ocp-v4.0-art-dev"); err != nil {
+			return "", relatedImages, fmt.Errorf("failed to push signature for component1 manifest %s: %w", d, err)
+		}
+	}
+
+	component2 := toRegistry + "/openshift-release-dev/ocp-v4.0-art-dev:component2"
+	digest2, err := GenerateFakeImage("component2", component2, tempFolder)
+	if err != nil {
+		return "", relatedImages, err
+	}
+	contents.Ref2 = toRegistry + "/openshift-release-dev/ocp-v4.0-art-dev@" + digest2
+	relatedImages = append(relatedImages, contents.Ref2)
+
+	// Push signature images for all manifests in component2
+	digests2, err := GetAllManifestDigests(component2)
+	if err != nil {
+		return "", relatedImages, fmt.Errorf("failed to get manifests for component2: %w", err)
+	}
+	for _, d := range digests2 {
+		if err := PushSignatureImage(d, toRegistry, "openshift-release-dev/ocp-v4.0-art-dev"); err != nil {
+			return "", relatedImages, fmt.Errorf("failed to push signature for component2 manifest %s: %w", d, err)
+		}
+	}
+
+	component3 := toRegistry + "/openshift-release-dev/ocp-v4.0-art-dev:component3"
+	digest3, err := GenerateFakeImage("component3", component3, tempFolder)
+	if err != nil {
+		return "", relatedImages, err
+	}
+	contents.Ref3 = toRegistry + "/openshift-release-dev/ocp-v4.0-art-dev@" + digest3
+	relatedImages = append(relatedImages, contents.Ref3)
+
+	// Push signature images for all manifests in component3
+	digests3, err := GetAllManifestDigests(component3)
+	if err != nil {
+		return "", relatedImages, fmt.Errorf("failed to get manifests for component3: %w", err)
+	}
+	for _, d := range digests3 {
+		if err := PushSignatureImage(d, toRegistry, "openshift-release-dev/ocp-v4.0-art-dev"); err != nil {
+			return "", relatedImages, fmt.Errorf("failed to push signature for component3 manifest %s: %w", d, err)
+		}
+	}
+
+	releaseImg := toRegistry + "/openshift-release-dev/ocp-release:4.15.0-x86_64"
+	digest, err := GenerateFakeRelease(contents, releaseImg, tempFolder, templatePath)
+	if err != nil {
+		return "", relatedImages, err
+	}
+	relatedImages = append(relatedImages, toRegistry+"/openshift-release-dev/ocp-release@"+digest)
+
+	// Push signature images for all manifests in the release image
+	releaseDigests, err := GetAllManifestDigests(releaseImg)
+	if err != nil {
+		return "", relatedImages, fmt.Errorf("failed to get manifests for release: %w", err)
+	}
+	for _, d := range releaseDigests {
+		if err := PushSignatureImage(d, toRegistry, "openshift-release-dev/ocp-release"); err != nil {
+			return "", relatedImages, fmt.Errorf("failed to push signature for release manifest %s: %w", d, err)
+		}
+	}
+
+	return digest, relatedImages, nil
+}
+
+func GenerateFakeRelease(imageRefs releaseContents, releaseImgRef, tempFolder string, templateFile string) (string, error) {
+	err := ImgRefsFromTemplate(tempFolder+"/image-references", templateFile, imageRefs)
+	if err != nil {
+		return "", err
+	}
+	imgSpec, err := image.ParseRef(releaseImgRef)
+	if err != nil {
+		return "", err
+	}
+	sanitizedTagOrDigest := imgSpec.Tag
+	if imgSpec.Tag == "" {
+		sanitizedTagOrDigest = imgSpec.Digest
+	} else {
+		sanitizedTagOrDigest = strings.ReplaceAll(sanitizedTagOrDigest, ".", "-")
+	}
+
+	indexFolder := filepath.Join(tempFolder, imgSpec.PathComponent, sanitizedTagOrDigest)
+	err = os.MkdirAll(indexFolder, 0o755)
+	if err != nil {
+		return "", err
+	}
+
+	imageRefsBytes, err := os.ReadFile(tempFolder + "/image-references")
+	if err != nil {
+		return "", err
+	}
+	releaseMetaBytes, err := os.ReadFile("../../e2e/templates/release_templates/release-metadata")
+	if err != nil {
+		return "", err
+	}
+	c := map[string][]byte{
+		"/release-manifests/image-references": imageRefsBytes,
+		"/release-manifests/release-metadata": releaseMetaBytes,
+	}
+	return buildAndPushFakeImage(c, releaseImgRef, indexFolder)
+}
+
+type CincinnatiMock struct {
+	Templates map[string]string
+	Tokens    []string
+}
+
+func (c CincinnatiMock) CincinnatiHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	mtype := r.Header.Get("Accept")
+	if mtype != GraphMediaType {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+
+	keys, ok := r.URL.Query()["channel"]
+	if !ok {
+		// t.Fail()
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	ch := keys[len(keys)-1]
+
+	responseTemplate, ok := c.Templates[ch]
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	responseBytes, err := ByteArrayFromTemplate(responseTemplate, c.Tokens)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	_, err = w.Write(responseBytes)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+// PushSignatureImage creates and pushes a sigstore-style signature image to the registry.
+// The signature tag format is: sha256-<digest>.sig
+func PushSignatureImage(imgDigest, registryHost, repository string) error {
+	// Parse the digest to create the signature tag
+	digestStr := strings.TrimPrefix(imgDigest, "sha256:")
+	sigTag := fmt.Sprintf("sha256-%s.sig", digestStr)
+
+	// Create a minimal signature image (just a config layer)
+	sigContent := map[string][]byte{
+		"/signature": []byte("fake signature content for " + imgDigest),
+	}
+
+	// Build the full image reference with signature tag
+	sigImgRef := fmt.Sprintf("%s/%s:%s", registryHost, repository, sigTag)
+
+	tag, err := name.NewTag(sigImgRef)
+	if err != nil {
+		return fmt.Errorf("failed to create signature tag: %w", err)
+	}
+
+	// Create the signature image
+	img, err := crane.Image(sigContent)
+	if err != nil {
+		return fmt.Errorf("failed to create signature image: %w", err)
+	}
+
+	// Convert to OCI manifest format
+	ociImg := mutate.MediaType(img, types.OCIManifestSchema1)
+	ociImg = mutate.ConfigMediaType(ociImg, types.OCIConfigJSON)
+
+	// Push the image
+	if err := remote.Write(tag, ociImg); err != nil {
+		return fmt.Errorf("failed to push signature image: %w", err)
+	}
+
+	return nil
+}
+
